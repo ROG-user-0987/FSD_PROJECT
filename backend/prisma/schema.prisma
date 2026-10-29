@@ -1,0 +1,385 @@
+// InventoryOS database schema (Prisma ORM 7, SQLite via better-sqlite3)
+//
+// STATUS: Phase 0 draft for review. Not migrated yet.
+//
+// Conventions
+// - Integer auto-increment ids: simple, small indexes, readable URLs (/products/42).
+//   The API is behind auth, so sequential ids leak nothing useful.
+// - Money: Prisma Decimal + decimal.js, never JS floats. SQLite has no DECIMAL(p,s),
+//   so precision (prices 2 dp, costs 4 dp) is enforced by Zod and by rounding in the
+//   services. Money totals are summed in decimal.js, not in SQL.
+// - Enums are stored as TEXT; Prisma Client rejects invalid values.
+// - Nothing that has stock history is ever deleted: products, warehouses and users
+//   are deactivated (isActive = false). Foreign keys to history use onDelete: Restrict.
+// - Rules Prisma cannot express ("CHECK" comments below, append-only ledger) are
+//   SQLite triggers. They are listed at the bottom of this file.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+  // Prisma 7: the database URL (file:./dev.db) lives in prisma.config.ts, not here.
+}
+
+// ---------------------------------------------------------------- Enums
+
+enum Role {
+  ADMIN
+  MANAGER
+  EMPLOYEE
+  VIEWER
+}
+
+enum TransactionType {
+  STOCK_IN // goods received (manual)
+  PURCHASE // goods received against a supplier purchase
+  STOCK_OUT // goods removed (manual: damage, internal use, ...)
+  SALE // goods sold: this is the demand signal for forecasting
+  RETURN // customer return (stock comes back)
+  ADJUSTMENT // stock-count correction, positive or negative
+  TRANSFER_OUT // left the source warehouse (transfer dispatched)
+  TRANSFER_IN // arrived at the destination warehouse (transfer received)
+}
+
+enum TransferStatus {
+  REQUESTED
+  APPROVED
+  IN_TRANSIT
+  RECEIVED
+  CANCELLED
+}
+
+enum NotificationType {
+  LOW_STOCK
+  OUT_OF_STOCK
+  TRANSFER
+}
+
+// ---------------------------------------------------------------- Users and auth
+
+model User {
+  id           Int      @id @default(autoincrement())
+  email        String   @unique // lower-cased by the API before saving
+  passwordHash String // bcrypt, cost 12
+  name         String
+  role         Role
+  warehouseId  Int? // required for EMPLOYEE, null for everyone else (CHECK)
+  isActive     Boolean  @default(true) // false = cannot log in, refresh or connect a socket
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  warehouse           Warehouse?             @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+  refreshTokens       RefreshToken[]
+  transactions        InventoryTransaction[]
+  requestedTransfers  StockTransfer[]        @relation("TransferRequestedBy")
+  approvedTransfers   StockTransfer[]        @relation("TransferApprovedBy")
+  dispatchedTransfers StockTransfer[]        @relation("TransferDispatchedBy")
+  receivedTransfers   StockTransfer[]        @relation("TransferReceivedBy")
+  cancelledTransfers  StockTransfer[]        @relation("TransferCancelledBy")
+  notifications       Notification[]
+  auditLogs           AuditLog[]
+  idempotencyRecords  IdempotencyRecord[]
+
+  @@index([role, isActive]) // "all active ADMIN and MANAGER users" for alerts
+  @@index([warehouseId])
+}
+
+// Refresh tokens are random opaque strings, not JWTs. Only a SHA-256 hash is
+// stored (a fast hash is fine because the token itself is 256 bits of randomness).
+// Rotation: every /auth/refresh revokes the presented token and issues a new one.
+// Reuse detection: presenting an already-revoked token revokes all of the user's tokens.
+model RefreshToken {
+  id        Int       @id @default(autoincrement())
+  userId    Int
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------- Catalogue
+
+model Category {
+  id        Int      @id @default(autoincrement())
+  name      String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  products Product[]
+}
+
+model Supplier {
+  id           Int      @id @default(autoincrement())
+  name         String   @unique
+  email        String?
+  phone        String?
+  address      String?
+  leadTimeDays Int // days from order to delivery; input to reorder recommendations (CHECK > 0)
+  rating       Decimal? // 0.0 to 5.0 (CHECK)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  products Product[]
+}
+
+model Product {
+  id           Int      @id @default(autoincrement())
+  sku          String   @unique // the unique index doubles as the Product(sku) index
+  name         String
+  description  String?
+  categoryId   Int
+  brand        String?
+  supplierId   Int
+  costPrice    Decimal // supplier list cost: reference only, never used for valuation
+  avgCost      Decimal  @default(0) // weighted-average cost, recomputed on STOCK_IN / PURCHASE
+  sellingPrice Decimal
+  reorderLevel Int      @default(0) // low-stock threshold, applied per (product, warehouse)
+  imageUrl     String?
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  category      Category               @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  supplier      Supplier               @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  inventory     Inventory[]
+  transactions  InventoryTransaction[]
+  transferItems StockTransferItem[]
+  forecasts     Forecast[]
+
+  @@index([name])
+  @@index([categoryId])
+  @@index([supplierId])
+}
+
+// ---------------------------------------------------------------- Stock
+
+model Warehouse {
+  id        Int      @id @default(autoincrement())
+  name      String   @unique
+  code      String   @unique // short code shown in the UI, e.g. "HYD"
+  city      String
+  address   String?
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users        User[]
+  inventory    Inventory[]
+  transactions InventoryTransaction[]
+  transfersOut StockTransfer[]        @relation("TransferFrom")
+  transfersIn  StockTransfer[]        @relation("TransferTo")
+}
+
+// Current stock of one product in one warehouse. The ONLY place stock is stored.
+// Invariant: quantity = SUM(quantityChange) of this pair's InventoryTransaction rows.
+model Inventory {
+  id          Int      @id @default(autoincrement())
+  productId   Int
+  warehouseId Int
+  quantity    Int      @default(0) // CHECK (quantity >= 0)
+  updatedAt   DateTime @updatedAt
+
+  // Cascade from Product only succeeds for a product with no history:
+  // its transactions use Restrict, so deleting a product with history fails.
+  product   Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+
+  @@unique([productId, warehouseId])
+  @@index([warehouseId])
+}
+
+// Append-only ledger of every stock movement. A trigger rejects UPDATE and DELETE.
+// Corrections are new ADJUSTMENT rows.
+model InventoryTransaction {
+  id             Int             @id @default(autoincrement())
+  productId      Int
+  warehouseId    Int
+  type           TransactionType
+  quantityChange Int // signed: positive = in, negative = out (CHECK <> 0)
+  unitCost       Decimal // cost frozen at the time: incoming cost for receipts, avgCost (COGS) for everything else
+  balanceAfter   Int // warehouse quantity right after this movement (CHECK >= 0)
+  reason         String?
+  reference      String? // free text, e.g. invoice or order number
+  transferId     Int? // set on TRANSFER_OUT / TRANSFER_IN rows
+  userId         Int
+  createdAt      DateTime        @default(now())
+
+  // All Restrict: history is never deleted. (SetNull would issue an UPDATE,
+  // which the append-only trigger rejects anyway.)
+  product   Product        @relation(fields: [productId], references: [id], onDelete: Restrict)
+  warehouse Warehouse      @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+  transfer  StockTransfer? @relation(fields: [transferId], references: [id], onDelete: Restrict)
+  user      User           @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([productId, createdAt])
+  @@index([warehouseId, createdAt])
+  @@index([type, createdAt])
+  @@index([userId, createdAt])
+  @@index([transferId])
+}
+
+// ---------------------------------------------------------------- Transfers
+
+// REQUESTED -> APPROVED -> IN_TRANSIT -> RECEIVED; CANCELLED only before IN_TRANSIT.
+// Stock leaves the source on dispatch and arrives at the destination on receive.
+// Who/when is stored for every step so the UI can draw the status timeline.
+model StockTransfer {
+  id              Int            @id @default(autoincrement())
+  fromWarehouseId Int
+  toWarehouseId   Int // CHECK (fromWarehouseId <> toWarehouseId)
+  status          TransferStatus @default(REQUESTED)
+  note            String?
+  requestedById   Int
+  approvedById    Int?
+  dispatchedById  Int?
+  receivedById    Int?
+  cancelledById   Int?
+  approvedAt      DateTime?
+  dispatchedAt    DateTime?
+  receivedAt      DateTime?
+  cancelledAt     DateTime?
+  createdAt       DateTime       @default(now()) // = requested at
+  updatedAt       DateTime       @updatedAt
+
+  fromWarehouse Warehouse              @relation("TransferFrom", fields: [fromWarehouseId], references: [id], onDelete: Restrict)
+  toWarehouse   Warehouse              @relation("TransferTo", fields: [toWarehouseId], references: [id], onDelete: Restrict)
+  requestedBy   User                   @relation("TransferRequestedBy", fields: [requestedById], references: [id], onDelete: Restrict)
+  approvedBy    User?                  @relation("TransferApprovedBy", fields: [approvedById], references: [id], onDelete: Restrict)
+  dispatchedBy  User?                  @relation("TransferDispatchedBy", fields: [dispatchedById], references: [id], onDelete: Restrict)
+  receivedBy    User?                  @relation("TransferReceivedBy", fields: [receivedById], references: [id], onDelete: Restrict)
+  cancelledBy   User?                  @relation("TransferCancelledBy", fields: [cancelledById], references: [id], onDelete: Restrict)
+  items         StockTransferItem[]
+  transactions  InventoryTransaction[]
+
+  @@index([status, createdAt])
+  @@index([fromWarehouseId, status])
+  @@index([toWarehouseId, status])
+}
+
+model StockTransferItem {
+  id         Int      @id @default(autoincrement())
+  transferId Int
+  productId  Int
+  quantity   Int // CHECK (quantity > 0)
+  unitCost   Decimal? // null until dispatch, then frozen (avgCost at dispatch)
+
+  transfer StockTransfer @relation(fields: [transferId], references: [id], onDelete: Restrict)
+  product  Product       @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@unique([transferId, productId]) // one line per product per transfer
+  @@index([productId])
+}
+
+// ---------------------------------------------------------------- Notifications
+
+// One row per recipient, so read/unread is per user.
+model Notification {
+  id        Int              @id @default(autoincrement())
+  userId    Int
+  type      NotificationType
+  title     String
+  message   String
+  data      Json? // e.g. { productId, warehouseId, quantity, reorderLevel } for deep links
+  readAt    DateTime?
+  createdAt DateTime         @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([userId, readAt])
+}
+
+// ---------------------------------------------------------------- Forecasting
+
+// Written by the nightly Python job (one row per product per run; history is kept).
+// The API reads the latest row per product. Demand is measured in units, not money,
+// so Float is fine here.
+model Forecast {
+  id             Int      @id @default(autoincrement())
+  productId      Int
+  generatedAt    DateTime @default(now())
+  horizonDays    Int // 30
+  modelName      String // "seasonal_naive_7" | "moving_average_28" | "ets" | "ses" | "croston_sba"
+  predictedDaily Json // [{ "date": "2026-11-01", "qty": 4.2 }, ...]
+  predictedTotal Float
+  wape           Float? // backtest WAPE of the chosen model (null when actual demand was 0)
+  baselineWape   Float? // seasonal-naive WAPE, for comparison
+  trainingDays   Int // non-censored days used for training
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId, generatedAt(sort: Desc)])
+}
+
+// ---------------------------------------------------------------- Audit and idempotency
+
+// Admin-relevant changes: users, products, warehouses, reorder levels.
+model AuditLog {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  action    String // e.g. "user.create", "product.update", "product.reorderLevel.change"
+  entity    String // "User" | "Product" | "Warehouse" | ...
+  entityId  String // string so any id type fits
+  before    Json?
+  after     Json?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([entity, entityId])
+  @@index([userId, createdAt])
+  @@index([createdAt])
+}
+
+// Idempotency for stock in/out/adjust and every transfer action.
+// Written in the SAME database transaction as the change it protects:
+// - retry with same key + same body  -> replay the stored response, change nothing
+// - same key + different body        -> 422 (requestHash differs)
+// - two identical requests in parallel -> the unique index lets only one commit
+// A separate table (instead of a column on InventoryTransaction) is used because
+// approve/cancel create no transaction rows, and dispatch/receive create several.
+model IdempotencyRecord {
+  id          Int      @id @default(autoincrement())
+  key         String // value of the Idempotency-Key header
+  userId      Int
+  endpoint    String // e.g. "POST /inventory/stock-out"; a key cannot be reused on another endpoint
+  requestHash String // SHA-256 of the canonical JSON request body
+  statusCode  Int
+  response    Json // original response body, replayed on retry
+  createdAt   DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, key]) // keys are scoped per user
+  @@index([createdAt]) // for cleanup of old keys
+}
+
+// ---------------------------------------------------------------- Database guards (SQLite triggers)
+//
+// Applied by src/config/dbGuards.ts with CREATE TRIGGER IF NOT EXISTS on every
+// server start, seed run and test run. Why not only a migration: when a later
+// migration alters a table, Prisma's SQLite migrations rebuild it (create new
+// table, copy, drop old), which silently drops that table's triggers. Re-applying
+// them idempotently means they can never go missing. A test checks they exist.
+//
+// BEFORE INSERT and BEFORE UPDATE guards (RAISE(ABORT, ...)):
+//   Inventory             quantity >= 0
+//   InventoryTransaction  quantityChange <> 0, balanceAfter >= 0, unitCost >= 0
+//   StockTransfer         fromWarehouseId <> toWarehouseId
+//   StockTransferItem     quantity > 0, unitCost >= 0
+//   Product               costPrice, avgCost, sellingPrice >= 0; reorderLevel >= 0
+//   Supplier              leadTimeDays > 0; rating BETWEEN 0 AND 5
+//   User                  (role = 'EMPLOYEE') = (warehouseId IS NOT NULL)
+//
+// Append-only ledger: BEFORE UPDATE and BEFORE DELETE ON InventoryTransaction -> RAISE(ABORT).
+//   Tests start from a fresh database file, so they never need to delete ledger rows.
+//
+// Foreign keys: SQLite only enforces them with PRAGMA foreign_keys = ON, which the
+// Prisma client setup turns on for its connection (also verified by a test).

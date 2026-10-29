@@ -1,0 +1,11 @@
+{
+  // Used by `npm run build`: compiles only src/ into dist/ for production.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "rootDir": "src",
+    "outDir": "dist",
+    "sourceMap": true
+  },
+  "include": ["src"]
+}

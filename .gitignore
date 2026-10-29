@@ -1,0 +1,22 @@
+# Root ignore rules. frontend/ and backend/ also have their own .gitignore.
+node_modules/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+*.log
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+__pycache__/
+.venv/
+.pytest_cache/
+playwright-report/
+test-results/
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+.idea/

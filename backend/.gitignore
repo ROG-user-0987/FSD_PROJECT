@@ -1,0 +1,17 @@
+node_modules
+dist
+.env
+.env.*
+!.env.example
+# Prisma 7 generates the client into src/ — regenerate with `npx prisma generate`
+src/generated
+# Python (forecasting job)
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+# SQLite database files (dev data and the test database)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
